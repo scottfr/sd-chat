@@ -1,0 +1,2180 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SD Chat Experiment</title>
+    <link rel="stylesheet" href="styles.css">
+    
+    <script src="./texts.js"></script>
+<script>
+
+// Set initial UI state immediately to prevent flash
+(function() {
+    const hasApiKey = localStorage.getItem('openai-api-key');
+    const style = document.createElement('style');
+    
+    style.textContent = hasApiKey ? `
+        #welcome-message { display: none !important; }
+        #input-container { display: block !important; }
+        #api-key-collapsed { display: flex !important; }
+        #api-key-expanded { display: none !important; }
+    ` : `
+        #welcome-message { display: flex !important; }
+        #input-container { display: none !important; }
+        #example-prompts { display: none !important; }
+        #api-key-collapsed { display: none !important; }
+        #api-key-expanded { display: flex !important; }
+    `;
+    
+    document.head.appendChild(style);
+})();
+</script>
+
+<script type="importmap">
+  {
+    "imports": {
+      "simulation": "https://unpkg.com/simulation@7.0.0",
+      "marked": "https://esm.sh/marked@9.1.2",
+      "katex": "https://esm.sh/katex@0.16.8"
+    }
+  }
+</script>
+
+<!-- KaTeX CSS -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.css" integrity="sha384-GvrOXuhMATgEsSwCs4smul74iXGOixntILdUW9XmUC6+HX0sLNAK3q71HotJqlAn" crossorigin="anonymous">
+
+<script type="module">
+import { loadModelJSON } from 'simulation';
+import { marked } from "marked";
+import katex from "katex";
+
+class ChatApp {
+    constructor() {
+        this.apiKey = localStorage.getItem('openai-api-key') || '';
+        this.selectedModel = localStorage.getItem('selected-model') || 'gpt-4.1';
+        this.messages = [];
+        this.isStreaming = false;
+        this.isBuilding = false;
+        this.isEditing = false;
+        this.buildStatusElement = null;
+        this.attachedFile = null;
+        this.streamingController = null;
+        this.buildingController = null;
+        this.originalApiKey = this.apiKey;
+        
+        this.initializeElements();
+        this.bindEvents();
+        this.loadApiKey();
+    }
+
+    initializeElements() {
+        this.modelSelect = document.getElementById('model-select');
+        this.apiKeyInput = document.getElementById('api-key');
+        this.saveKeyButton = document.getElementById('save-key');
+        this.deleteKeyButton = document.getElementById('delete-key');
+        this.deleteKeyCollapsedButton = document.getElementById('delete-key-collapsed');
+        this.editKeyButton = document.getElementById('edit-key-button');
+        this.apiKeyCollapsed = document.getElementById('api-key-collapsed');
+        this.apiKeyExpanded = document.getElementById('api-key-expanded');
+        this.messagesContainer = document.getElementById('messages');
+        this.messageInput = document.getElementById('message-input');
+        this.sendButton = document.getElementById('send-button');
+        this.welcomeMessage = document.getElementById('welcome-message');
+        this.inputContainer = document.getElementById('input-container');
+        this.fileButton = document.getElementById('file-button');
+        this.fileInput = document.getElementById('file-input');
+        this.filePreview = document.getElementById('file-preview');
+        this.examplePrompts = document.getElementById('example-prompts');
+    }
+
+    bindEvents() {
+        this.modelSelect.addEventListener('change', () => this.saveModel());
+        this.saveKeyButton.addEventListener('click', () => this.saveApiKey());
+        this.deleteKeyButton.addEventListener('click', () => this.deleteApiKey());
+        this.deleteKeyCollapsedButton.addEventListener('click', () => this.deleteApiKey());
+        this.editKeyButton.addEventListener('click', () => this.expandApiKey());
+        this.sendButton.addEventListener('click', () => {
+            const action = this.sendButton.getAttribute('data-action');
+            if (action === 'cancel') {
+                this.cancelOperation();
+            } else {
+                this.sendMessage();
+            }
+        });
+        this.fileButton.addEventListener('click', () => this.fileInput.click());
+        this.fileInput.addEventListener('change', (e) => this.handleFileSelect(e));
+        
+        // Add event listeners for example prompts
+        this.examplePrompts.addEventListener('click', (e) => {
+            const promptElement = e.target.closest('.example-prompt');
+            if (promptElement) {
+                const prompt = promptElement.getAttribute('data-prompt');
+                if (prompt) {
+                    this.useExamplePrompt(prompt);
+                }
+            }
+        });
+        
+        this.messageInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                // Only send message if button is not disabled
+                if (!this.sendButton.disabled) {
+                    this.sendMessage();
+                }
+            }
+        });
+
+        this.messageInput.addEventListener('input', () => {
+            this.updateSendButton();
+            this.autoResize();
+        });
+
+        this.apiKeyInput.addEventListener('input', () => {
+            this.updateSendButton();
+            this.updateSaveButton();
+        });
+
+        this.apiKeyInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                if (!this.saveKeyButton.disabled) {
+                    this.saveApiKey();
+                }
+            }
+        });
+    }
+
+    loadApiKey() {
+        if (this.apiKey) {
+            this.apiKeyInput.value = this.apiKey;
+            this.collapseApiKey();
+            this.enableChat();
+        } else {
+            this.expandApiKey();
+            this.disableChat();
+        }
+        this.modelSelect.value = this.selectedModel;
+        this.updateSaveButton();
+    }
+
+    saveModel() {
+        this.selectedModel = this.modelSelect.value;
+        localStorage.setItem('selected-model', this.selectedModel);
+    }
+
+    saveApiKey() {
+        const key = this.apiKeyInput.value.trim();
+        if (key) {
+            // Show billing confirmation before saving
+            const confirmed = confirm(
+                'You will be billed by OpenAI for API usage when using SD Chat. You are solely responsible for any charges incurred. You must monitor your usage and set usage limits at the OpenAI dashboard to avoid unexpected charges.\n\n' +
+                'SD Chat is highly experimental and may have bugs. You use it at your own risk.\n\n' +
+                'By continuing, you confirm you understand and agree to this.'
+            );
+            
+            if (!confirmed) {
+                return; // Don't save if user doesn't confirm
+            }
+            
+            this.apiKey = key;
+            this.originalApiKey = key;
+            localStorage.setItem('openai-api-key', key);
+            this.collapseApiKey();
+            this.enableChat();
+            this.updateSaveButton();
+            this.showStatus('API key saved successfully!', 'success');
+        } else {
+            this.showStatus('Please enter a valid API key', 'error');
+        }
+    }
+
+    deleteApiKey() {
+        if (confirm('Are you sure you want to delete your saved API key?')) {
+            this.apiKey = '';
+            this.originalApiKey = '';
+            localStorage.removeItem('openai-api-key');
+            this.apiKeyInput.value = '';
+            this.expandApiKey();
+            this.disableChat();
+            // Clear any existing messages
+            this.messagesContainer.innerHTML = `
+                <div id="welcome-message" class="welcome-message main-width">
+                    <div class="welcome-content">
+                        <h2>Welcome to SD Chat</h2>
+                        <p>To get started, please enter your OpenAI API key in the header above.</p>
+                        
+                        <div class="help-text">
+                            <h3>How to get an API key:</h3>
+                            <ol>
+                                <li>Visit <a href="https://platform.openai.com/api-keys" target="_blank">OpenAI API Keys</a></li>
+                                <li>Sign in to your OpenAI account</li>
+                                <li>Click "Create new secret key"</li>
+                                <li>Copy the key and paste it above</li>
+                            </ol>
+                            <p class="note">Your API key is stored locally in your browser and never sent to our servers.</p>
+                        </div>
+
+                        <div class="billing-warning">
+                            <strong>⚠️ Important:</strong> You will be billed by OpenAI for API usage. Check their <a href="https://openai.com/pricing" target="_blank">pricing page</a> for current rates.
+                        </div>
+                    </div>
+                </div>
+            `;
+            this.welcomeMessage = document.getElementById('welcome-message');
+            this.messages = [];
+            this.updateSaveButton();
+            this.showStatus('API key deleted successfully!', 'success');
+        }
+    }
+
+    updateSaveButton() {
+        const currentKey = this.apiKeyInput.value.trim();
+        const hasChanged = currentKey !== this.originalApiKey;
+        const hasValidKey = currentKey.length > 0;
+        this.saveKeyButton.disabled = !hasChanged || !hasValidKey;
+    }
+
+    collapseApiKey() {
+        this.apiKeyCollapsed.style.setProperty('display', 'flex', 'important');
+        this.apiKeyExpanded.style.setProperty('display', 'none', 'important');
+    }
+
+    expandApiKey() {
+        this.apiKeyCollapsed.style.setProperty('display', 'none', 'important');
+        this.apiKeyExpanded.style.setProperty('display', 'flex', 'important');
+    }
+
+    showDeleteButton() {
+        this.deleteKeyButton.style.setProperty('display', 'block', 'important');
+    }
+
+    hideDeleteButton() {
+        this.deleteKeyButton.style.setProperty('display', 'none', 'important');
+    }
+
+    enableChat() {
+        this.welcomeMessage.style.setProperty('display', 'none', 'important');
+        this.inputContainer.style.setProperty('display', 'block', 'important');
+        this.messageInput.disabled = false;
+        this.updateSendButton();
+        this.updateExamplePrompts();
+    }
+
+    disableChat() {
+        this.welcomeMessage.style.setProperty('display', 'flex', 'important');
+        this.inputContainer.style.setProperty('display', 'none', 'important');
+        this.messageInput.disabled = true;
+        this.examplePrompts.style.setProperty('display', 'none', 'important');
+    }
+
+    updateExamplePrompts() {
+        const shouldShow = this.apiKey.length > 0 && this.messages.length === 0;
+        this.examplePrompts.style.setProperty('display', shouldShow ? 'grid' : 'none', 'important');
+    }
+
+    useExamplePrompt(prompt) {
+        this.messageInput.value = prompt;
+        this.updateSendButton();
+        this.autoResize();
+        // Focus the input so user can modify if needed
+        this.messageInput.focus();
+    }
+
+    updateSendButton() {
+        const hasKey = this.apiKeyInput.value.trim().length > 0;
+        
+        // Check if file is ready based on type
+        let fileReady = false;
+        if (this.attachedFile) {
+            const fileType = this.attachedFile.fileType;
+            if (fileType === 'pdf') {
+                fileReady = !!this.attachedFile.openaiFileId && !this.attachedFile.isUploading;
+            } else if (fileType === 'text') {
+                fileReady = !!this.attachedFile.textContent;
+            } else if (fileType === 'image') {
+                fileReady = true; // Images are processed during sendMessage
+            }
+        }
+        
+        const hasMessage = this.messageInput.value.trim().length > 0 || fileReady;
+        const isOperating = this.isStreaming || this.isBuilding;
+        
+        if (isOperating) {
+            // Show as cancel button
+            this.sendButton.disabled = false;
+            this.sendButton.style.cursor = 'pointer';
+            this.sendButton.innerHTML = `
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+                    <rect x="6" y="6" width="12" height="12" fill="currentColor"/>
+                </svg>
+            `;
+            this.sendButton.setAttribute('data-action', 'cancel');
+        } else {
+            // Show as send button
+            this.sendButton.disabled = !hasKey || !hasMessage || this.isEditing;
+            this.sendButton.style.cursor = this.sendButton.disabled ? 'normal' : 'pointer';
+            this.sendButton.innerHTML = `
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+                    <path d="M7 11L12 6L17 11M12 18V7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+            `;
+            this.sendButton.setAttribute('data-action', 'send');
+        }
+        
+        // Update any active edit save buttons
+        const activeEditMessages = document.querySelectorAll('.message');
+        activeEditMessages.forEach(messageElement => {
+            if (messageElement.updateSaveButtonState) {
+                messageElement.updateSaveButtonState();
+            }
+        });
+    }
+
+    cancelOperation() {
+        if (this.isStreaming) {
+            this.cancelStreaming();
+        }
+        if (this.isBuilding) {
+            this.cancelBuilding();
+        }
+    }
+
+    cancelStreaming() {
+        // Cancel the streaming request if possible
+        if (this.streamingController) {
+            this.streamingController.abort();
+        }
+        
+        // Reset streaming state
+        this.isStreaming = false;
+        this.updateSendButton();
+        
+        // Find and remove any incomplete assistant messages
+        const messages = Array.from(this.messagesContainer.children);
+        const lastMessage = messages[messages.length - 1];
+        if (lastMessage && lastMessage.classList.contains('assistant')) {
+            const content = lastMessage.querySelector('.content');
+            if (content && (content.textContent.trim() === '' || content.innerHTML.includes('spinner'))) {
+                lastMessage.remove();
+                this.messages.pop(); // Remove from messages array too
+            }
+        }
+    }
+
+    cancelBuilding() {
+        // Cancel the building request if possible
+        if (this.buildingController) {
+            this.buildingController.abort();
+        }
+        
+        // Reset building state
+        this.isBuilding = false;
+        this.updateSendButton();
+        
+        // Remove the build status element
+        if (this.buildStatusElement) {
+            this.buildStatusElement.remove();
+            this.buildStatusElement = null;
+            // Also remove from messages array
+            if (this.messages.length > 0) {
+                this.messages.pop();
+            }
+        }
+    }
+
+    async handleFileSelect(event) {
+        const file = event.target.files[0];
+        if (!file) return;
+
+        const fileType = this.getFileType(file);
+        
+        // Check file size based on type
+        if (fileType === 'pdf' && file.size > 25 * 1024 * 1024) {
+            this.showStatus('PDF files must be less than 25MB', 'error');
+            return;
+        } else if (fileType === 'image' && file.size > 10 * 1024 * 1024) {
+            this.showStatus('Image files must be less than 10MB', 'error');
+            return;
+        } else if (fileType === 'text' && file.size > 1 * 1024 * 1024) {
+            this.showStatus('Text files must be less than 1MB', 'error');
+            return;
+        }
+
+        // Store file with type information
+        this.attachedFile = file;
+        this.attachedFile.fileType = fileType;
+        this.showFilePreview(file);
+        this.updateSendButton();
+
+        try {
+            if (fileType === 'pdf') {
+                // Upload PDFs to Files API
+                this.attachedFile.isUploading = true;
+                this.updateSendButton();
+                const fileId = await this.uploadFileToOpenAI(file);
+                this.attachedFile.openaiFileId = fileId;
+                this.attachedFile.isUploading = false;
+                this.updateSendButton();
+            } else if (fileType === 'text') {
+                // Read text files immediately
+                const textContent = await this.readTextFile(file);
+                this.attachedFile.textContent = textContent;
+            }
+            // Images will be processed during sendMessage()
+            
+            this.updateSendButton();
+        } catch (error) {
+            console.error('File processing failed:', error);
+            if (this.attachedFile && this.attachedFile.isUploading) {
+                this.attachedFile.isUploading = false;
+                this.updateSendButton();
+            }
+            this.showStatus(`File processing failed: ${error.message}`, 'error');
+        }
+        
+        // Focus the message input so user can start typing
+        this.messageInput.focus();
+    }
+
+    showFilePreview(file) {
+        const fileType = file.type.startsWith('image/') ? 'image' : 'document';
+        
+        this.filePreview.innerHTML = `
+            <div class="file-item">
+                <div class="file-info">
+                    <span class="file-icon">${fileType === 'image' ? '🖼️' : '📄'}</span>
+                    <span class="file-name">${file.name}</span>
+                    <span class="file-size">(${this.formatFileSize(file.size)})</span>
+                </div>
+                <button class="remove-file">×</button>
+            </div>
+        `;
+        
+        // Add event listener to the remove button
+        const removeButton = this.filePreview.querySelector('.remove-file');
+        removeButton.addEventListener('click', () => this.removeFile());
+        
+        this.filePreview.style.display = 'block';
+    }
+
+    removeFile() {
+        this.attachedFile = null;
+        this.filePreview.style.display = 'none';
+        this.fileInput.value = '';
+        this.updateSendButton();
+    }
+
+    formatFileSize(bytes) {
+        if (bytes === 0) return '0 Bytes';
+        const k = 1024;
+        const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    }
+
+    createBlobUrlFromDataUrl(dataUrl) {
+        try {
+            // Extract the base64 data and MIME type from the data URL
+            const [header, base64Data] = dataUrl.split(',');
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
+            
+            // Convert base64 to binary
+            const byteCharacters = atob(base64Data);
+            const byteNumbers = new Array(byteCharacters.length);
+            for (let i = 0; i < byteCharacters.length; i++) {
+                byteNumbers[i] = byteCharacters.charCodeAt(i);
+            }
+            const byteArray = new Uint8Array(byteNumbers);
+            
+            // Create blob and return blob URL
+            const blob = new Blob([byteArray], { type: mimeType });
+            return URL.createObjectURL(blob);
+        } catch (error) {
+            console.error('Error creating blob URL:', error);
+            return null;
+        }
+    }
+
+    downloadFileFromDataUrl(dataUrl, fileName) {
+        try {
+            // Create a temporary anchor element to trigger download
+            const link = document.createElement('a');
+            link.href = dataUrl;
+            link.download = fileName;
+            link.style.display = 'none';
+            
+            // Append to body, click, and remove
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        } catch (error) {
+            console.error('Error downloading file:', error);
+            // Last resort: show the user a message
+            alert(`Could not open file: ${fileName}. Browser security restrictions may be preventing file access.`);
+        }
+    }
+
+    restoreMessageContent(messageElement, text) {
+        const contentElement = messageElement.querySelector('.content');
+        const hasFileAttachment = messageElement.dataset.hasFileAttachment === 'true';
+        
+        // Clear existing content
+        contentElement.innerHTML = '';
+        
+        // Add text content if present
+        if (text && text.trim()) {
+            const textDiv = document.createElement('div');
+            textDiv.className = 'message-text';
+            textDiv.textContent = text;
+            contentElement.appendChild(textDiv);
+        }
+        
+        // Restore file attachment if it exists
+        if (hasFileAttachment && messageElement.dataset.originalFileAttachment) {
+            contentElement.insertAdjacentHTML('beforeend', messageElement.dataset.originalFileAttachment);
+            
+            // Re-attach click event listener to the restored file attachment
+            const restoredFileAttachment = contentElement.querySelector('.file-attachment');
+            
+            if (restoredFileAttachment && messageElement.dataset.fileDataUrl) {
+                // Restore dataset attributes from stored values
+                const dataUrl = messageElement.dataset.fileDataUrl;
+                const fileName = messageElement.dataset.fileFileName || 'file';
+                const fileType = messageElement.dataset.fileFileType || 'application/octet-stream';
+                
+                // Set the dataset on the restored element
+                restoredFileAttachment.dataset.dataUrl = dataUrl;
+                restoredFileAttachment.dataset.fileName = fileName;
+                restoredFileAttachment.dataset.fileType = fileType;
+                
+                // Re-attach the click handler
+                restoredFileAttachment.addEventListener('click', () => {
+                    const blobUrl = this.createBlobUrlFromDataUrl(dataUrl);
+                    if (blobUrl) {
+                        window.open(blobUrl, '_blank');
+                        setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+                    } else {
+                        this.downloadFileFromDataUrl(dataUrl, fileName);
+                    }
+                });
+                
+                // Restore title attribute
+                const actionText = fileType.startsWith('image/') ? 'Click to view image' : 'Click to download file';
+                restoredFileAttachment.title = `${actionText}: ${fileName}`;
+            }
+        }
+    }
+
+
+    fileToBase64(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.readAsDataURL(file);
+            reader.onload = () => {
+                // Extract base64 part (remove data:type;base64, prefix)
+                const base64 = reader.result.split(',')[1];
+                resolve(base64);
+            };
+            reader.onerror = error => reject(error);
+        });
+    }
+
+    autoResize() {
+        this.messageInput.style.height = 'auto';
+        this.messageInput.style.height = Math.min(this.messageInput.scrollHeight, 200) + 'px';
+    }
+
+    async sendMessage() {
+        const message = this.messageInput.value.trim();
+        if ((!message && !this.attachedFile) || !this.apiKey || this.isStreaming || this.isBuilding || this.isEditing) return;
+
+        // Prepare the message content structure for files
+        let userMessageContent;
+        
+        if (this.attachedFile) {
+            const fileType = this.attachedFile.fileType;
+            
+            if (fileType === 'pdf') {
+                // Handle PDFs with Files API
+                if (!this.attachedFile.openaiFileId) {
+                    this.showStatus('PDF still uploading. Please wait.', 'error');
+                    return;
+                }
+                
+                userMessageContent = [
+                    {
+                        type: 'input_text',
+                        text: message || `[Uploaded file: ${this.attachedFile.name}]`
+                    },
+                    {
+                        type: 'input_file',
+                        file_id: this.attachedFile.openaiFileId
+                    }
+                ];
+                
+            } else if (fileType === 'image') {
+                // Handle images with base64
+                const base64Data = await this.fileToBase64(this.attachedFile);
+                const mimeType = this.attachedFile.type || 'application/octet-stream';
+                const dataUrl = `data:${mimeType};base64,${base64Data}`;
+                
+                userMessageContent = [
+                    {
+                        type: 'input_text',
+                        text: message || `[Uploaded image: ${this.attachedFile.name}]`
+                    },
+                    {
+                        type: 'input_image',
+                        image_url: dataUrl
+                    }
+                ];
+                
+            } else if (fileType === 'text') {
+                // Handle text files by including content
+                if (!this.attachedFile.textContent) {
+                    this.showStatus('File content not loaded. Please try again.', 'error');
+                    return;
+                }
+                
+                userMessageContent = [
+                    {
+                        type: 'input_text',
+                        text: message || `[Uploaded file: ${this.attachedFile.name}]`
+                    },
+                    {
+                        type: 'input_text',
+                        text: `\n\n[File: ${this.attachedFile.name}]\n${this.attachedFile.textContent}`
+                    }
+                ];
+            }
+            
+            // Show message with separate file attachment
+            this.addMessageWithFile('user', message, this.attachedFile, null);
+        } else {
+            // For text-only messages, create proper content structure
+            userMessageContent = [
+                {
+                    type: 'input_text',
+                    text: message
+                }
+            ];
+            this.addMessage('user', message);
+        }
+        
+        // Store the structured content in the messages array
+        this.messages[this.messages.length - 1].content = userMessageContent;
+        
+        const currentFile = this.attachedFile;
+        this.messageInput.value = '';
+        this.removeFile();
+        this.updateSendButton();
+        this.autoResize();
+
+        this.isStreaming = true;
+        this.updateSendButton();
+        
+        // Create the request BEFORE adding the empty assistant message
+        const planRequest = this.createPlanRequest();
+        const assistantMessageElement = this.addMessage('assistant', '');
+        
+        let streamingSuccessful = false;
+        try {
+            await this.streamOpenAIResponse(planRequest, currentFile, assistantMessageElement);
+            streamingSuccessful = true;
+        } catch (error) {
+            if (error.name === 'AbortError') {
+                // Silent handling for user cancellation
+                console.log('Request cancelled by user');
+            } else {
+                // Error is already shown in the message by streamOpenAIResponse
+                // Just ensure streamingSuccessful remains false
+                streamingSuccessful = false;
+            }
+        } finally {
+            this.isStreaming = false;
+            this.updateSendButton();
+        }
+
+        // Only proceed with model building if streaming completed successfully (not cancelled)
+        // Double-check: ensure not currently streaming and that stream was successful
+        if (streamingSuccessful && !this.isStreaming) {
+            let shouldBuild = await this.runCheckBuild();
+            console.log('Build decision:', shouldBuild);
+            if (shouldBuild) {
+                this.isBuilding = true;
+                this.updateSendButton();
+                this.buildStatusElement = this.addMessage('assistant', '<div style="display: flex; align-items: center; gap: 10px;"><div class="spinner"></div>Building model...</div>');
+                
+                try {
+                    let model = await this.runBuild();
+                    console.log('FINAL MODEL:', model);
+                    
+                    // Update the message content with the actual ModelJSON for conversation history
+                    this.messages[this.messages.length - 1].content = model;
+                    
+                    this.showModelCompletion(this.buildStatusElement, JSON.parse(model));
+                } catch (error) {
+                    console.error('Build error:', error);
+                    if (error.name === 'MaxIterationsError') {
+                        this.showMaxIterationsError(this.buildStatusElement, error.currentModel);
+                    } else {
+                        this.updateMessageContent(this.buildStatusElement, `❌ Model build failed: ${error.message}`);
+                    }
+                } finally {
+                    this.isBuilding = false;
+                    this.buildStatusElement = null;
+                    this.updateSendButton();
+                }
+            }
+        }
+    }
+
+    addMessageWithFile(role, textContent, file, dataUrl = null) {
+        const messageElement = document.createElement('div');
+        messageElement.className = `message ${role}`;
+        
+        // Store original text content for clean editing
+        messageElement.dataset.originalText = textContent || '';
+        
+        const avatar = document.createElement('div');
+        avatar.className = 'avatar';
+        avatar.textContent = role === 'user' ? 'U' : 'AI';
+        
+        const contentElement = document.createElement('div');
+        contentElement.className = 'content';
+        
+        // Add text content if present
+        if (textContent && textContent.trim()) {
+            const textDiv = document.createElement('div');
+            textDiv.className = 'message-text';
+            textDiv.textContent = textContent;
+            contentElement.appendChild(textDiv);
+        }
+        
+        // Add file attachment if present
+        if (file) {
+            const fileDiv = document.createElement('div');
+            fileDiv.className = 'file-attachment';
+            
+            const fileIcon = file.type.startsWith('image/') ? '🖼️' : '📄';
+            fileDiv.innerHTML = `
+                <div class="file-info">
+                    <span class="file-icon">${fileIcon}</span>
+                    <span class="file-name">${file.name}</span>
+                    <span class="file-size">(${this.formatFileSize(file.size)})</span>
+                </div>
+            `;
+            
+            // Add click handler if dataUrl is provided
+            if (dataUrl) {
+                // Store dataUrl and file info in dataset for restoration after edit/cancel
+                fileDiv.dataset.dataUrl = dataUrl;
+                fileDiv.dataset.fileName = file.name;
+                fileDiv.dataset.fileType = file.type;
+                
+                fileDiv.addEventListener('click', () => {
+                    // Convert data URL to blob URL to avoid browser restrictions
+                    const blobUrl = this.createBlobUrlFromDataUrl(dataUrl);
+                    if (blobUrl) {
+                        window.open(blobUrl, '_blank');
+                        
+                        // Clean up blob URL after a short delay to prevent memory leaks
+                        setTimeout(() => {
+                            URL.revokeObjectURL(blobUrl);
+                        }, 1000);
+                    } else {
+                        // Fallback: try to trigger download instead
+                        this.downloadFileFromDataUrl(dataUrl, file.name);
+                    }
+                });
+                
+                // Add title attribute for better UX
+                const actionText = file.type.startsWith('image/') ? 'Click to view image' : 'Click to download file';
+                fileDiv.title = `${actionText}: ${file.name}`;
+            }
+            
+            contentElement.appendChild(fileDiv);
+        }
+        
+        // Add edit button for user messages
+        if (role === 'user') {
+            const editBtn = document.createElement('button');
+            editBtn.className = 'edit-btn';
+            editBtn.innerHTML = `
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/>
+                    <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                </svg>
+            `;
+            editBtn.addEventListener('click', () => this.editMessage(messageElement));
+            messageElement.appendChild(editBtn);
+        }
+        
+        messageElement.appendChild(avatar);
+        messageElement.appendChild(contentElement);
+        
+        // Check if we should auto-scroll BEFORE adding to DOM
+        const shouldScroll = this.shouldAutoScroll();
+        
+        this.messagesContainer.appendChild(messageElement);
+        
+        // Scroll if we determined we should before the update
+        if (shouldScroll) {
+            this.scrollToBottom();
+        }
+        
+        // Store the display text for the messages array
+        const displayContent = textContent + (file ? `\n📎 ${file.name}` : '');
+        this.messages.push({ role, content: displayContent });
+        
+        // Hide examples after first message
+        if (this.messages.length === 1) {
+            this.updateExamplePrompts();
+        }
+        
+        return messageElement;
+    }
+
+    addMessage(role, content) {
+        const messageElement = document.createElement('div');
+        messageElement.className = `message ${role}`;
+        
+        // Store original text content for clean editing
+        messageElement.dataset.originalText = typeof content === 'string' ? content : '';
+        
+        const avatar = document.createElement('div');
+        avatar.className = 'avatar';
+        avatar.textContent = role === 'user' ? 'U' : 'AI';
+        
+        const contentElement = document.createElement('div');
+        contentElement.className = 'content';
+        
+        if (role === 'assistant') {
+            if (content) {
+                // Check if content contains HTML tags (spinner case)
+                if (content.includes('<div') && content.includes('spinner')) {
+                    contentElement.innerHTML = content;
+                } else {
+                    // Process LaTeX first, then markdown
+                    const processedContent = this.processLatex(content);
+                    contentElement.innerHTML = marked.parse(processedContent);
+                }
+            } else {
+                // Show thinking indicator with spinner instead of just "..."
+                contentElement.innerHTML = `
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <div class="spinner"></div>
+                        <span>Thinking...</span>
+                    </div>
+                `;
+            }
+        } else {
+            contentElement.textContent = content;
+            
+            // Add edit button for user messages
+            if (role === 'user') {
+                const editBtn = document.createElement('button');
+                editBtn.className = 'edit-btn';
+                editBtn.innerHTML = `
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/>
+                        <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                    </svg>
+                `;
+                editBtn.addEventListener('click', () => this.editMessage(messageElement));
+                messageElement.appendChild(editBtn);
+            }
+        }
+        
+        messageElement.appendChild(avatar);
+        messageElement.appendChild(contentElement);
+        
+        // Check if we should auto-scroll BEFORE adding to DOM
+        const shouldScroll = this.shouldAutoScroll();
+        
+        this.messagesContainer.appendChild(messageElement);
+        
+        // Scroll if we determined we should before the update
+        if (shouldScroll) {
+            this.scrollToBottom();
+        }
+        
+        this.messages.push({ role, content });
+        
+        // Hide examples after first message
+        if (this.messages.length === 1) {
+            this.updateExamplePrompts();
+        }
+        
+        return messageElement;
+    }
+
+    updateMessageContent(messageElement, content) {
+        const contentElement = messageElement.querySelector('.content');
+        
+        // Check if we should auto-scroll BEFORE updating content
+        const shouldScroll = this.shouldAutoScroll();
+        
+        // Update content
+        if (content.includes('<div') && content.includes('spinner')) {
+            contentElement.innerHTML = content;
+        } else {
+            // Process LaTeX first, then markdown
+            const processedContent = this.processLatex(content);
+            contentElement.innerHTML = marked.parse(processedContent);
+        }
+        
+        // Scroll if we determined we should before the update
+        if (shouldScroll) {
+            this.scrollToBottom();
+        }
+    }
+
+    // Check if user is near bottom (call BEFORE content updates)
+    shouldAutoScroll() {
+        const container = this.messagesContainer;
+        const threshold = 50; // Allow 50px tolerance for "near bottom"
+        return container.scrollTop + container.clientHeight >= container.scrollHeight - threshold;
+    }
+    
+    // Scroll to bottom (call AFTER content updates)
+    scrollToBottom() {
+        const container = this.messagesContainer;
+        container.scrollTop = container.scrollHeight;
+    }
+    
+    processLatex(content) {
+        // Replace LaTeX expressions with rendered HTML before markdown processing
+        let processedContent = content;
+        
+        // Replace display math $$...$$ and \[...\]
+        processedContent = processedContent.replace(/\$\$([\s\S]*?)\$\$/g, (match, latex) => {
+            try {
+                return katex.renderToString(latex, { displayMode: true });
+            } catch (e) {
+                console.error('LaTeX render error:', e);
+                return match; // Return original if parsing fails
+            }
+        });
+        
+        processedContent = processedContent.replace(/\\\[([\s\S]*?)\\\]/g, (match, latex) => {
+            try {
+                return katex.renderToString(latex, { displayMode: true });
+            } catch (e) {
+                console.error('LaTeX render error:', e);
+                return match;
+            }
+        });
+        
+        // Replace inline math $...$ and \(...\)
+        processedContent = processedContent.replace(/\$([^$\n]+?)\$/g, (match, latex) => {
+            try {
+                return katex.renderToString(latex, { displayMode: false });
+            } catch (e) {
+                console.error('LaTeX render error:', e);
+                return match;
+            }
+        });
+        
+        processedContent = processedContent.replace(/\\\(([^)]+?)\\\)/g, (match, latex) => {
+            try {
+                return katex.renderToString(latex, { displayMode: false });
+            } catch (e) {
+                console.error('LaTeX render error:', e);
+                return match;
+            }
+        });
+        
+        return processedContent;
+    }
+
+    currentMessages() {
+        return this.messages.map(msg => ({
+            role: msg.role,
+            content: msg.content
+        }));
+    }
+
+    getHeaders() {
+        return {
+            'Authorization': `Bearer ${this.apiKey}`,
+        }
+    }
+
+    getErrorMessage(error) {
+        // Handle different error types with user-friendly messages
+        if (error.code === 'context_length_exceeded') {
+            return 'Message too long for model. Try shortening your input or conversation history.';
+        } else if (error.code === 'rate_limit_exceeded') {
+            return 'API rate limit reached. Please wait and try again.';
+        } else if (error.type === 'authentication_error') {
+            return 'Invalid API key. Please check your API key.';
+        } else if (error.code === 'insufficient_quota') {
+            return 'API quota exceeded. Check your OpenAI billing.';
+        } else {
+            return error.message || 'An unknown error occurred';
+        }
+    }
+
+    getFileType(file) {
+        const extension = file.name.toLowerCase().split('.').pop();
+        const mimeType = file.type.toLowerCase();
+        
+        // Image files
+        if (mimeType.startsWith('image/') || ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].includes(extension)) {
+            return 'image';
+        }
+        
+        // PDF files
+        if (mimeType === 'application/pdf' || extension === 'pdf') {
+            return 'pdf';
+        }
+        
+        // Text files
+        const textExtensions = ['txt', 'md', 'csv', 'json', 'xml', 'html', 'css', 'js', 'py', 'java', 'cpp', 'c', 'h'];
+        if (mimeType.startsWith('text/') || textExtensions.includes(extension)) {
+            return 'text';
+        }
+        
+        // Default to text for unknown types (will attempt to read as text)
+        return 'text';
+    }
+
+    async readTextFile(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = () => reject(new Error('Failed to read file'));
+            reader.readAsText(file);
+        });
+    }
+
+    async uploadFileToOpenAI(file) {
+        try {
+            // Create FormData for multipart upload
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('purpose', 'user_data');
+
+            const response = await fetch('https://api.openai.com/v1/files', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${this.apiKey}`
+                    // Don't set Content-Type - browser will set it with boundary
+                },
+                body: formData
+            });
+
+            if (!response.ok) {
+                const error = await response.json();
+                const errorMessage = this.getErrorMessage(error.error || error);
+                throw new Error(errorMessage);
+            }
+
+            const result = await response.json();
+            return result.id; // Return the file ID
+        } catch (error) {
+            console.error('File upload error:', error);
+            throw error;
+        }
+    }
+
+    createPlanRequest() {
+        const conversationMessages = this.currentMessages();
+        const requestData = {
+            model: this.selectedModel,
+            input: conversationMessages,
+            stream: true,
+            store: false,
+            instructions: 'You are part of a team of agents, there is a DESIGNER agent who designs a model and an IMPLEMENTOR agent that implements it. You are the DESIGNER agent.\n\nYou are an expert System Dynamics modeler helping a user. If they ask you to build a model, think through the high-level plan first, especially feedback loops, stocks and flows. You can then map out the mathematical equations for the model and search for any information you need to complete the model. You will stop at designing the model. You won\'t offer to implement it, and you won\'t ask the user questions. If you need information, use the web search tool. You use the Insight Maker and simulation_package syntax when doing modeling (e.g. square brackets around primitive names like `[Population]`; and the following list of primitives: stocks, flows, variables, links, states and transitions).'
+        };
+
+        return requestData;
+    }
+
+    async runCheckBuild() {
+        const conversationMessages = this.currentMessages();
+        
+        let targetIndex = conversationMessages.findLastIndex(m => m.role === 'user');
+        let messageCount = 1;
+        if (targetIndex > 0) {
+            messageCount = 2;
+            targetIndex--;
+        }
+
+        const checkRequest = {
+            model: 'gpt-4.1',
+            input: [{
+                role: 'user',
+                content: 'Here are the messages to analyze :\n' + JSON.stringify(conversationMessages.slice(targetIndex, targetIndex + 2), null, 2)
+            }],
+            stream: false,
+            store: false,
+            instructions: `You are analyzing a conversation to determine if the user is asking for a model to be built or modified, in which case you should return "BUILD". If they are just asking a question and don\'t want a model output, return "NO_BUILD". Analyze the last messages and decide if the user currently wants a model to be built or modified. Return your response as valid JSON with a single field "decision" that must be either "BUILD" or "NO_BUILD".`,
+            text: {
+                format: {
+                    type: "json_schema",
+                    name: "build_decision",
+                    strict: true,
+                    schema: {
+                        type: "object",
+                        properties: {
+                            decision: {
+                                type: "string",
+                                enum: ["BUILD", "NO_BUILD"]
+                            }
+                        },
+                        required: ["decision"],
+                        additionalProperties: false
+                    }
+                }
+            }
+        };
+
+        try {
+            const response = await fetch('https://api.openai.com/v1/responses', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${this.apiKey}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(checkRequest)
+            });
+
+            if (!response.ok) {
+                const error = await response.json();
+                const errorMessage = this.getErrorMessage(error.error || error);
+                this.showStatus(errorMessage, 'error');
+                throw new Error(errorMessage);
+            }
+
+            const result = await response.json();
+            
+            
+            console.log('Build intent check result:', result);
+            const content = result.output[0].content[0].text;
+            console.log('Build intent check content:', content);
+            
+            if (content) {
+                try {
+                    const parsed = JSON.parse(content);
+                    return parsed.decision === "BUILD";
+                } catch (jsonError) {
+                    console.error('Error parsing decision JSON:', jsonError, 'Raw content:', content);
+                    return false;
+                }
+            }
+            
+            return false;
+        } catch (error) {
+            console.error('Error checking build intent:', error);
+            return false;
+        }
+    }
+
+    async runBuild() {
+        console.log('Running build process...');
+        let iterations = 0;
+
+        
+        let localMessages = this.currentMessages().slice();
+        while (true) {
+            let buildRequest = {
+                model: this.selectedModel,
+                input: [
+                    {
+                        "role": "system",
+                        "content": `
+You are a detailed and practical modeller. You use the ModelJSON (with the SIMULATION_PACKAGE engine, which is also used in Insight Maker) format to specify your models.
+
+Parsimony is important, don't make the model too complex. Keep things simple.
+
+Notes: 
+
+- DO NOT USE UNITS IN YOUR MODEL
+- You should have 2 - 4 visualization, no more
+- You should have up to 2 - 5 interactive elements, no more
+
+Implement the desired model carefully and accurately.
+
+Here is information about the ModelJSON format:
+
+${MODEL_JSON_PROMPT}
+
+Here is information about the SIMULATION_PACKAGE engine:
+
+${SIMULATION_PACKAGE_PROMPT}
+`
+                    }
+                ].concat(localMessages),
+                text: {
+                    format:  {type: "json_object" }
+                }
+            };
+
+            // Create new AbortController for this request
+            this.buildingController = new AbortController();
+
+            const response = await fetch('https://api.openai.com/v1/responses', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${this.apiKey}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(buildRequest),
+                signal: this.buildingController.signal
+            });
+
+            if (!response.ok) {
+                const error = await response.json();
+                const errorMessage = this.getErrorMessage(error.error || error);
+                this.showStatus(errorMessage, 'error');
+                
+                // Stop building and clean up
+                this.isBuilding = false;
+                this.updateSendButton();
+                
+                // Remove build status element
+                if (this.buildStatusElement) {
+                    this.buildStatusElement.remove();
+                    this.buildStatusElement = null;
+                    this.messages.pop();
+                }
+                
+                throw new Error(errorMessage);
+            }
+
+            const result = await response.json();
+            
+            
+            console.log('Build result:', result);
+            // reasoning models have a type=reasoning
+            let modelStr = result.output.find(o => o.type === 'message').content[0].text;
+
+
+
+            let modelData = JSON.parse(modelStr);
+
+            // o3 somethimes adds numbers like "0" or "1". Filter those out.
+            modelData.elements = modelData.elements.filter(x => !!x.type);
+
+            let errors = this.getModelErrors(modelData);
+
+            if (!errors && modelData.elements.length === 0) {
+                errors = {
+                    type: 'format',
+                    errors: ['The elements array has no elements in it.']
+                };
+            }
+
+            let madeRepairs = false;
+            if (errors && errors.type === 'static') {
+                for (let error of errors.errors) {
+                    if (error.toString().includes('Attempted to reference')) {
+                        let source = error.primitive.name;
+                        let target = error.details;
+
+                        console.log('[REPAIRING] Adding link ', source, target);
+
+                        if (modelData.elements.find(primitive => primitive.name.toLowerCase() === target.toLowerCase())) {
+                            madeRepairs = true;
+                            modelData.elements.push({
+                                type: "LINK",
+                                from: target,
+                                to: source
+                            })
+                        }
+                    }
+                }
+            }
+
+            if (madeRepairs) {
+                console.log('Made automatic repairs to the model');
+                errors = this.getModelErrors(modelData);
+            }
+
+
+            modelStr = JSON.stringify(modelData, null, 2);
+
+
+            localMessages.push({
+                role: "assistant",
+                content: modelStr
+            });
+
+            if (!errors) {
+                // success!
+                return JSON.stringify(modelData)
+            }
+
+
+            if (errors.type === 'format') {
+                let msg = `
+I attempted to load model and found the following errors with the ModelJSON format:
+
+${errors.errors.map(e => `- ${e}`).join('\n')}
+
+It looks like there is something wrong with your ModelJSON generation. Please correct the issue.`;
+
+                // format errors
+               localMessages.push({
+                    role: "user",
+                    content: msg
+                });
+
+                console.log('[FORMAT ERROR]', msg);
+                
+                if (this.buildStatusElement) {
+                    this.updateMessageContent(this.buildStatusElement, `<div style="display: flex; align-items: center; gap: 10px;"><div class="spinner"></div>Fixing format errors... (attempt ${iterations + 1})</div>`);
+                }
+
+            } else if (errors.type === 'static') {
+                let msg = `
+I tested the model and found the following static errors:
+
+${errors.errors.map(e => `- [${e.primitive.name}]: ${e.message}`).join('\n')}
+
+Please correct them.`;
+
+                // static errors
+                localMessages.push({
+                    role: "user",
+                    content: msg
+                });
+
+                console.log('[STATIC ERROR]', msg);
+                
+                if (this.buildStatusElement) {
+                    this.updateMessageContent(this.buildStatusElement, `<div style="display: flex; align-items: center; gap: 10px;"><div class="spinner"></div>Fixing static errors... (attempt ${iterations + 1})</div>`);
+                }
+            } else if (errors.type === 'runtime') {
+                let msg = `
+I tested the model and found this runtime error:
+
+[${errors.error.primitive.name}]: ${errors.error.message}
+
+Please correct it. Note that only the first runtime error is shown. There may be more errors in the model.
+`;
+
+                // runtime errors
+                localMessages.push({
+                    role: "user",
+                    content: msg
+                });
+
+                console.log('[RUNTIME ERROR]', msg);
+                
+                if (this.buildStatusElement) {
+                    this.updateMessageContent(this.buildStatusElement, `<div style="display: flex; align-items: center; gap: 10px;"><div class="spinner"></div>Fixing runtime errors... (attempt ${iterations + 1})</div>`);
+                }
+            } else {
+                throw new Error("Unknown error type: " + errors.type);
+            }
+
+            iterations++;
+
+            if (iterations > 2) {
+                // Create a special error that includes the current model state
+                const maxIterationsError = new Error("Too many implementor iterations");
+                maxIterationsError.name = "MaxIterationsError";
+                maxIterationsError.currentModel = JSON.stringify(modelData, null, 2);
+                throw maxIterationsError;
+            }
+
+        }
+
+    }
+
+
+    /**
+     * @param {object} modelData 
+     */
+    getModelErrors(modelData) {
+        let model;
+        
+        try {
+            model = loadModelJSON(modelData);
+        } catch (e) {
+            if (e.name === 'ModelJSONError') {
+                return {
+                    type: 'format',
+                    errors: e.errors
+                }
+            } else {
+                throw e;
+            }
+        }
+
+
+        // static errors
+
+        let errors = model.check();
+
+        if (errors.length > 0) {
+            return {
+                type: 'static',
+                errors
+            };
+        }
+
+
+        // runtime errors
+
+        try {
+            model.simulate();
+        } catch (e) {
+            return {
+                type: 'runtime',
+                error: e
+            }
+        }
+
+
+        return null;
+    }
+        
+
+    async streamOpenAIResponse(requestData, file, messageElement) {
+        // Create new AbortController for this request
+        this.streamingController = new AbortController();
+        
+        let headers = this.getHeaders();
+        headers['Content-Type'] = 'application/json';
+
+        // File content is already properly structured in the messages array
+        const requestBody = JSON.stringify(requestData);
+
+        const response = await fetch('https://api.openai.com/v1/responses', {
+            method: 'POST',
+            headers,
+            body: requestBody,
+            signal: this.streamingController.signal
+        });
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error?.message || 'Failed to connect to OpenAI');
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let assistantMessage = '';
+        let buffer = '';
+
+        try {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                const chunk = decoder.decode(value);
+                buffer += chunk;
+                
+                // Process complete lines
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || ''; // Keep incomplete line in buffer
+
+                for (const line of lines) {
+                    if (line.startsWith('event: error')) {
+                        // Handle error events
+                        continue; // Move to next line to get the data
+                    } else if (line.startsWith('data: ')) {
+                        const data = line.slice(6).trim();
+                        if (data === '[DONE]') break;
+                        if (data === '') continue; // Skip empty data
+
+                        try {
+                            const parsed = JSON.parse(data);
+                            
+                            // Check if this is an error event
+                            if (parsed.type === 'error' && parsed.error) {
+                                const errorMessage = this.getErrorMessage(parsed.error);
+                                this.showStatus(errorMessage, 'error');
+                                
+                                // Show error in the message instead of removing it
+                                const fullErrorMessage = `❌ **Error**: ${errorMessage}`;
+                                this.updateMessageContent(messageElement, fullErrorMessage);
+                                this.messages[this.messages.length - 1].content = fullErrorMessage;
+                                
+                                // Stop streaming
+                                this.isStreaming = false;
+                                this.updateSendButton();
+                                
+                                throw new Error(errorMessage);
+                            }
+                            
+                            // Handle different Responses API event types - be more specific
+                            let content = null;
+                            
+                            // Priority order to avoid duplicates
+                            if (parsed.type === 'response.output_text.delta' && parsed.delta) {
+                                content = parsed.delta;
+                            } else if (parsed.type === 'response.content.delta' && parsed.content_part?.text) {
+                                content = parsed.content_part.text;
+                            } else if (parsed.choices?.[0]?.delta?.content) {
+                                // Standard chat completions format (fallback)
+                                content = parsed.choices[0].delta.content;
+                            } else if (parsed.delta?.content && !parsed.type) {
+                                // Fallback for delta content without type
+                                content = parsed.delta.content;
+                            }
+                            
+                            if (content && content.length > 0) {
+                                assistantMessage += content;
+                                this.updateMessageContent(messageElement, assistantMessage);
+                            }
+                        } catch (e) {
+                            console.error('Error parsing JSON:', e, 'Data length:', data.length, 'First 100 chars:', data.substring(0, 100));
+                            // Skip malformed chunks - they're often incomplete due to streaming
+                            continue;
+                        }
+                    }
+                }
+            }
+        } finally {
+            reader.releaseLock();
+        }
+
+        // Update the messages array with the complete response
+        this.messages[this.messages.length - 1].content = assistantMessage;
+    }
+
+    showModelCompletion(messageElement, modelJson) {
+        const modelString = encodeURIComponent(JSON.stringify(modelJson));
+        const canPreview = modelString.length <= 8000;
+        
+        const downloadJson = JSON.stringify(modelJson, null, 2);
+        const blob = new Blob([downloadJson], { type: 'application/json' });
+        const downloadUrl = URL.createObjectURL(blob);
+        
+        const contentElement = messageElement.querySelector('.content');
+        
+        // Check if we should auto-scroll BEFORE updating content
+        const shouldScroll = this.shouldAutoScroll();
+        
+        contentElement.innerHTML = `
+            <div class="preview-header">
+                <span class="preview-title">✅ Model built successfully!</span>
+                ${canPreview ? `
+                <a href="https://insightmaker.com/modeljson/view?modeljson=${modelString}" target="_blank" class="btn btn-sm">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
+                    </svg>
+                    Fullscreen
+                </a>
+                ` : ''}
+            </div>
+            ${canPreview ? `
+            <div class="preview-container">
+                <iframe src="https://insightmaker.com/modeljson/view?modeljson=${modelString}" class="iframe-preview" frameborder="0"></iframe>
+            </div>
+            ` : ''}
+            <div style="margin: 15px 0; display: flex; gap: 10px; flex-wrap: wrap;">
+                <button class="download-btn btn">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                        <polyline points="7,10 12,15 17,10"/>
+                        <line x1="12" y1="15" x2="12" y2="3"/>
+                    </svg>
+                    Download ModelJSON
+                </button>
+                ${!canPreview ? `
+                <span style="background: #f59e0b; color: white; padding: 8px 16px; border-radius: 4px; font-size: 14px;">
+                    ⚠️ Model too large to preview here (>8KB). You can download it and import it into <a href="https://insightmaker.com/insight/" target="_blank">Insight Maker</a> to view it.
+                </span>
+                ` : ''}
+            </div>
+        `;
+        
+        // Add event listener to the download button
+        const downloadBtn = contentElement.querySelector('.download-btn');
+        if (downloadBtn) {
+            downloadBtn.addEventListener('click', () => {
+                const a = document.createElement('a');
+                a.href = downloadUrl;
+                a.download = 'model.json';
+                a.click();
+            });
+        }
+        
+        // Scroll if we determined we should before the update
+        if (shouldScroll) {
+            this.scrollToBottom();
+        }
+    }
+
+    showMaxIterationsError(messageElement, currentModelJson) {
+        const contentElement = messageElement.querySelector('.content');
+        
+        // Check if we should auto-scroll BEFORE updating content
+        const shouldScroll = this.shouldAutoScroll();
+        
+        // Create download blob for the current (broken) model
+        const downloadJson = currentModelJson;
+        const blob = new Blob([downloadJson], { type: 'application/json' });
+        const downloadUrl = URL.createObjectURL(blob);
+        
+        contentElement.innerHTML = `
+            <div class="preview-header"></div>
+            <div style="margin: 15px 0; background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 15px;">
+                <h4 style="margin: 0 0 10px 0; color: #dc2626;">Too many implementor iterations</h4>
+                <p style="margin: 0 0 15px 0; color: #374151;">
+                    The model builder attempted to fix errors but couldn't resolve all issues after multiple attempts. 
+                    You can still download the current version of the model to review or manually fix the remaining issues.
+                </p>
+                <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                    <button class="download-btn btn" style="background: #dc2626; color: white;">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                            <polyline points="7,10 12,15 17,10"/>
+                            <line x1="12" y1="15" x2="12" y2="3"/>
+                        </svg>
+                        Download Current Model
+                    </button>
+                </div>
+            </div>
+        `;
+        
+        // Add event listener to the download button
+        const downloadBtn = contentElement.querySelector('.download-btn');
+        if (downloadBtn) {
+            downloadBtn.addEventListener('click', () => {
+                const a = document.createElement('a');
+                a.href = downloadUrl;
+                a.download = 'model-broken.json';
+                a.click();
+            });
+        }
+        
+        // Scroll if we determined we should before the update
+        if (shouldScroll) {
+            this.scrollToBottom();
+        }
+    }
+
+    editMessage(messageElement) {
+        const contentElement = messageElement.querySelector('.content');
+        const editBtn = messageElement.querySelector('.edit-btn');
+        
+        // Check if this message has a file attachment
+        const fileAttachment = contentElement.querySelector('.file-attachment');
+        
+        // Use stored original text (set during message creation)
+        const currentText = messageElement.dataset.originalText || '';
+        
+        // Store edit state
+        messageElement.dataset.hasFileAttachment = fileAttachment ? 'true' : 'false';
+        
+        // Store the original file attachment HTML if it exists
+        if (fileAttachment) {
+            messageElement.dataset.originalFileAttachment = fileAttachment.outerHTML;
+            
+            // Store dataset attributes separately since outerHTML doesn't include JS-added attributes
+            if (fileAttachment.dataset.dataUrl) {
+                messageElement.dataset.fileDataUrl = fileAttachment.dataset.dataUrl;
+                messageElement.dataset.fileFileName = fileAttachment.dataset.fileName || '';
+                messageElement.dataset.fileFileType = fileAttachment.dataset.fileType || '';
+            }
+        }
+        const originalWidth = contentElement.offsetWidth;
+        const originalHeight = contentElement.offsetHeight;
+        
+        console.log('Starting edit of message:', currentText);
+        console.log('Stored original text:', messageElement.dataset.originalText);
+        
+        // Set editing state and update send button
+        this.isEditing = true;
+        this.updateSendButton();
+        
+        // Hide edit button during editing
+        editBtn.style.display = 'none';
+        
+        // Create edit form
+        const editForm = document.createElement('div');
+        editForm.className = 'edit-form';
+        editForm.innerHTML = `
+            <textarea class="edit-textarea" placeholder="Edit your message...">${currentText}</textarea>
+            <div class="edit-actions">
+                <button class="edit-save">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                        <path d="M7 11L12 6L17 11M12 18V7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                    <span>Send</span>
+                </button>
+                <button class="edit-cancel">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                        <path d="M18 6L6 18M6 6L18 18" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                    <span>Cancel</span>
+                </button>
+            </div>
+        `;
+        
+        // Preserve speech bubble dimensions and styling
+        contentElement.style.minWidth = originalWidth + 'px';
+        contentElement.style.minHeight = originalHeight + 'px';
+        
+        // Store original content and replace with edit form
+        contentElement.dataset.originalDisplay = contentElement.style.display || '';
+        contentElement.innerHTML = '';
+        contentElement.appendChild(editForm);
+        
+        const textarea = editForm.querySelector('.edit-textarea');
+        const saveBtn = editForm.querySelector('.edit-save');
+        const cancelBtn = editForm.querySelector('.edit-cancel');
+        
+        // Set initial button state based on streaming status
+        const updateSaveButtonState = () => {
+            const isOperating = this.isStreaming || this.isBuilding;
+            saveBtn.disabled = isOperating;
+        };
+        
+        // Set initial state
+        updateSaveButtonState();
+        
+        // Store reference to update function for potential cleanup
+        messageElement.updateSaveButtonState = updateSaveButtonState;
+        
+        // Auto-resize textarea and focus
+        textarea.style.height = 'auto';
+        textarea.style.height = textarea.scrollHeight + 'px';
+        textarea.focus();
+        textarea.select();
+        
+        // Handle save
+        saveBtn.addEventListener('click', () => {
+            if (saveBtn.disabled) return; // Prevent action if disabled
+            
+            const newText = textarea.value.trim();
+            if (newText && newText !== currentText) {
+                this.updateMessageAndResend(messageElement, newText);
+            } else {
+                this.cancelEdit(messageElement, editForm);
+            }
+        });
+        
+        // Handle cancel
+        cancelBtn.addEventListener('click', () => {
+            console.log('Cancel button clicked');
+            this.cancelEdit(messageElement, editForm);
+        });
+        
+        // Handle Enter key (with Shift+Enter for new lines)
+        textarea.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                saveBtn.click();
+            } else if (e.key === 'Escape') {
+                cancelBtn.click();
+            }
+        });
+        
+        // Auto-resize on input
+        textarea.addEventListener('input', () => {
+            textarea.style.height = 'auto';
+            textarea.style.height = textarea.scrollHeight + 'px';
+        });
+    }
+
+    cancelEdit(messageElement, editForm) {
+        const contentElement = messageElement.querySelector('.content');
+        const editBtn = messageElement.querySelector('.edit-btn');
+        
+        // Get the original text from the stored data attribute
+        const originalText = messageElement.dataset.originalText;
+        
+        // Restore original content and remove dimension constraints
+        contentElement.style.minWidth = '';
+        contentElement.style.minHeight = '';
+        contentElement.style.display = contentElement.dataset.originalDisplay || '';
+        
+        // Use helper function to restore content
+        this.restoreMessageContent(messageElement, originalText);
+        
+        // Clean up stored data
+        delete messageElement.dataset.originalText;
+        delete messageElement.dataset.hasFileAttachment;
+        delete messageElement.dataset.originalFileAttachment;
+        delete contentElement.dataset.originalDisplay;
+        
+        // Clean up temporary file data storage
+        delete messageElement.dataset.fileDataUrl;
+        delete messageElement.dataset.fileFileName;
+        delete messageElement.dataset.fileFileType;
+        
+        // Clean up edit button state update reference
+        delete messageElement.updateSaveButtonState;
+        
+        // Reset editing state and update send button
+        this.isEditing = false;
+        this.updateSendButton();
+        
+        // Restore edit button
+        if (editBtn) {
+            editBtn.style.display = 'block';
+            // Make sure edit button is properly attached to message element
+            if (!messageElement.contains(editBtn)) {
+                messageElement.appendChild(editBtn);
+            }
+        } else {
+            console.error('Edit button not found during cancel!');
+        }
+        
+        console.log('Cancel complete, content now:', contentElement.textContent);
+    }
+
+    updateMessageAndResend(messageElement, newText) {
+        // Find the index of this message in the conversation
+        const allMessageElements = Array.from(this.messagesContainer.querySelectorAll(".message"));
+        const messageIndex = allMessageElements.indexOf(messageElement);
+        
+        console.log('Editing message at index:', messageIndex);
+        console.log('Total messages before edit:', this.messages.length);
+        console.log('Total DOM elements before edit:', allMessageElements.length);
+        console.log('Messages before edit:', this.messages.map(m => 
+            typeof m.content === 'string' ? m.content.substring(0, 30) : '[Structured Content]'
+        ));
+        
+        // FIRST: Clear everything after this message point
+        this.clearConversationAfterIndex(messageIndex);
+        
+        // THEN: Update the message content
+        const contentElement = messageElement.querySelector('.content');
+        const hasFileAttachment = messageElement.dataset.hasFileAttachment === 'true';
+        
+        contentElement.style.minWidth = '';
+        contentElement.style.minHeight = '';
+        
+        // Use helper function to restore content with new text
+        this.restoreMessageContent(messageElement, newText);
+        
+        // Update the messages array - we need to preserve the structured content for API calls
+        const storedMessage = this.messages[messageIndex];
+        
+        if (Array.isArray(storedMessage.content)) {
+            // This is structured content for API calls - update the text part
+            const textContentItem = storedMessage.content.find(item => item.type === 'input_text');
+            if (textContentItem) {
+                textContentItem.text = newText;
+            }
+        } else if (hasFileAttachment) {
+            // This is display content - extract filename from original attachment and update
+            let fileName = 'Attached file';
+            const originalFileAttachment = messageElement.dataset.originalFileAttachment;
+            if (originalFileAttachment) {
+                const tempDiv = document.createElement('div');
+                tempDiv.innerHTML = originalFileAttachment;
+                const fileNameElement = tempDiv.querySelector('.file-name');
+                if (fileNameElement) {
+                    fileName = fileNameElement.textContent;
+                }
+            }
+            const displayContent = newText + `\n📎 ${fileName}`;
+            this.messages[messageIndex].content = displayContent;
+        } else {
+            // Simple text message
+            this.messages[messageIndex].content = newText;
+        }
+        
+        // Clean up stored data
+        delete messageElement.dataset.originalText;
+        delete messageElement.dataset.hasFileAttachment;
+        delete messageElement.dataset.originalFileAttachment;
+        delete contentElement.dataset.originalDisplay;
+        
+        // Clean up temporary file data storage
+        delete messageElement.dataset.fileDataUrl;
+        delete messageElement.dataset.fileFileName;
+        delete messageElement.dataset.fileFileType;
+        
+        // Clean up edit button state update reference
+        delete messageElement.updateSaveButtonState;
+        
+        console.log('Updated message content to:', newText);
+        console.log('Messages after update:', this.messages.map(m => 
+            typeof m.content === 'string' ? m.content.substring(0, 30) : '[Structured Content]'
+        ));
+        
+        // Restore edit button
+        const editBtn = messageElement.querySelector('.edit-btn');
+        if (editBtn) {
+            editBtn.style.display = 'block';
+        }
+        
+        // Hide example prompts since we have a conversation
+        this.updateExamplePrompts();
+        
+        // Automatically resend the conversation
+        this.resendFromCurrentPoint();
+        
+        // Reset editing state and update send button after successful update and resend
+        this.isEditing = false;
+        this.updateSendButton();
+    }
+
+    clearConversationAfterIndex(messageIndex) {
+        console.log(`Starting clear after index ${messageIndex}`);
+        
+        // Remove all DOM elements after this message
+        const allMessages = Array.from(this.messagesContainer.children);
+        const messagesToRemove = allMessages.slice(messageIndex + 1);
+        
+        console.log(`Removing ${messagesToRemove.length} DOM elements`);
+        messagesToRemove.forEach((msg, i) => {
+            console.log(`Removing DOM element ${messageIndex + 1 + i}:`, msg.querySelector('.content')?.textContent?.substring(0, 50));
+            msg.remove();
+        });
+        
+        // Truncate the messages array to this point
+        const oldLength = this.messages.length;
+        this.messages = this.messages.slice(0, messageIndex + 1);
+        
+        console.log(`Messages array: ${oldLength} -> ${this.messages.length}`);
+        console.log('Remaining messages:', this.messages.map(m => 
+            typeof m.content === 'string' ? m.content.substring(0, 30) : '[Structured Content]'
+        ));
+        
+        // Reset any ongoing operations
+        this.isStreaming = false;
+        this.isBuilding = false;
+        this.buildStatusElement = null;
+        
+        // Update UI state
+        this.updateSendButton();
+        
+        // Double-check the DOM matches our array
+        const finalDOMCount = this.messagesContainer.children.length;
+        console.log(`Final check - DOM elements: ${finalDOMCount}, Messages array: ${this.messages.length}`);
+        
+        if (finalDOMCount !== this.messages.length) {
+            console.error('WARNING: DOM and messages array are out of sync!');
+        }
+    }
+
+    async resendFromCurrentPoint() {
+        if (this.isStreaming || this.isBuilding) return;
+        
+        this.isStreaming = true;
+        this.updateSendButton();
+        
+        // Create the request BEFORE adding the empty assistant message  
+        const planRequest = this.createPlanRequest();
+        const assistantMessageElement = this.addMessage('assistant', '');
+        
+        let streamingSuccessful = false;
+        try {
+            await this.streamOpenAIResponse(planRequest, null, assistantMessageElement);
+            streamingSuccessful = true;
+        } catch (error) {
+            if (error.name === 'AbortError') {
+                // Silent handling for user cancellation
+                console.log('Request cancelled by user');
+            } else {
+                // Error is already shown in the message by streamOpenAIResponse
+                streamingSuccessful = false;
+            }
+        } finally {
+            this.isStreaming = false;
+            this.updateSendButton();
+        }
+
+        // Check if we should build a model (only if streaming was successful)
+        if (streamingSuccessful) {
+            let shouldBuild = await this.runCheckBuild();
+            console.log('Build decision:', shouldBuild);
+            if (shouldBuild) {
+                this.isBuilding = true;
+                this.updateSendButton();
+                this.buildStatusElement = this.addMessage('assistant', '<div style="display: flex; align-items: center; gap: 10px;"><div class="spinner"></div>Building model...</div>');
+                
+                try {
+                    let model = await this.runBuild();
+                    console.log('FINAL MODEL:', model);
+                    
+                    // Update the message content with the actual ModelJSON for conversation history
+                    this.messages[this.messages.length - 1].content = model;
+                    
+                    this.showModelCompletion(this.buildStatusElement, JSON.parse(model));
+                } catch (error) {
+                    if (error.name === 'AbortError') {
+                        // Silent handling for user cancellation
+                        console.log('Build cancelled by user');
+                    } else if (error.name === 'MaxIterationsError') {
+                        this.showMaxIterationsError(this.buildStatusElement, error.currentModel);
+                    } else {
+                        console.error('Build error:', error);
+                        this.updateMessageContent(this.buildStatusElement, `❌ Model build failed: ${error.message}`);
+                    }
+                } finally {
+                    this.isBuilding = false;
+                    this.buildStatusElement = null;
+                    this.updateSendButton();
+                }
+            }
+        }
+    }
+
+    showStatus(message, type) {
+        const status = document.createElement('div');
+        status.className = `status ${type}`;
+        status.textContent = message;
+        status.style.cssText = `
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 10px 20px;
+            border-radius: 4px;
+            color: white;
+            background: ${type === 'success' ? '#10b981' : '#ef4444'};
+            z-index: 1000;
+        `;
+        
+        document.body.appendChild(status);
+        setTimeout(() => status.remove(), 3000);
+    }
+}
+
+// Initialize the app when DOM is loaded
+document.addEventListener('DOMContentLoaded', () => {
+    new ChatApp();
+});
+</script>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="header-content">
+                <h1>🔄 SD Chat <span style="font-size: small; color: #777; padding-left: 12px;">🧪 Experimental</span></h1>
+                <div class="header-controls">
+                    <div class="model-selector">
+                        <label for="model-select">Model:</label>
+                        <select id="model-select" style="width: 120px">
+                            <option value="gpt-4.1">GPT-4.1 (fast model)</option>
+                            
+                            <option value="o3">o3 (strong model)</option>
+                        </select>
+                    </div>
+                    <div class="api-key-section">
+                    <div id="api-key-collapsed" class="api-key-collapsed" style="display: none;">
+                        <div class="api-key-status">
+                            <span class="status-check">✓</span>
+                            <span class="status-text">API Key</span>
+                        </div>
+                        <div class="api-key-actions">
+                            <button id="edit-key-button" class="edit-key-button" title="Edit API Key">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                                    <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                    <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                </svg>
+                            </button>
+                            <button id="delete-key-collapsed" class="delete-key-button" title="Delete API Key">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                                    <path d="M3 6h18" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                    <path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                </svg>
+                            </button>
+                        </div>
+                    </div>
+                    <div id="api-key-expanded" class="api-key-expanded">
+                        <label for="api-key">API Key:</label>
+                        <input type="password" id="api-key" />
+                        <button id="save-key" disabled>Save</button>
+                        <button id="delete-key" style="display: none;">Delete</button>
+                    </div>
+                    </div>
+                </div>
+                <script>
+                // Set API key input and model selector immediately to prevent flash
+                (function() {
+                    const hasApiKey = localStorage.getItem('openai-api-key');
+                    const input = document.getElementById('api-key');
+                    input.value = hasApiKey || '';
+                    input.placeholder = hasApiKey ? '' : 'Enter your OpenAI API key...';
+                    
+                    // Set model selector value immediately
+                    const savedModel = localStorage.getItem('selected-model') || 'gpt-4.1';
+                    const modelSelect = document.getElementById('model-select');
+                    modelSelect.value = savedModel;
+                })();
+                </script>
+            </div>
+        </div>
+
+        <div class="main-content">
+            <div class="chat-container">
+
+                    <div id="welcome-message" class="welcome-message main-width">
+                        <div class="welcome-content">
+                            <h2>Welcome to SD Chat</h2>
+                            <p>To get started, please enter your OpenAI API key in the header above.</p>
+                            <div class="billing-warning">
+                                <strong>⚠️ Important:</strong> You will be billed by OpenAI for API usage. Check their <a href="https://openai.com/pricing" target="_blank">pricing page</a> for current rates. Monitor usage in the <a href="https://platform.openai.com/usage" target="_blank">OpenAI dashboard</a> and set limits to avoid unexpected charges. SD Chat is experimental 🧪  and may have bugs.
+                            </div>
+                            <div class="help-text">
+                                <h3>How to get an API key:</h3>
+                                <ol>
+                                    <li>Visit <a href="https://platform.openai.com/api-keys" target="_blank">OpenAI API Keys</a></li>
+                                    <li>Sign in to your OpenAI account</li>
+                                    <li>Click "Create new secret key"</li>
+                                    <li>Copy the key and paste it above</li>
+                                </ol>
+                                <p class="note">Your API key is stored locally in your browser.</p>
+                            </div>
+                        </div>
+                    </div>
+
+                <div id="messages" class="messages main-width">
+                </div>
+                
+                <div id="example-prompts" class="example-prompts main-width" style="display: none;">
+                    <div class="examples-warning">
+                        <div class="billing-warning">
+                            <strong>⚠️ Important:</strong> You will be billed by OpenAI for API usage. Check their <a href="https://openai.com/pricing" target="_blank">pricing page</a> for current rates. Monitor your usage in the <a href="https://platform.openai.com/usage" target="_blank">OpenAI dashboard</a> and set usage limits to avoid unexpected charges.
+                            <br><br>
+                            🧪 SD Chat is highly experimental and may have bugs. Use at your own risk.
+                        </div>
+                    </div>
+                    <div class="example-prompt" data-prompt="Model predator and prey population dynamics">
+                        <div class="prompt-icon">🐺</div>
+                        <div class="prompt-text">Model predator and prey population dynamics</div>
+                    </div>
+                    <div class="example-prompt" data-prompt="Create a savings account growth model">
+                        <div class="prompt-icon">💰</div>
+                        <div class="prompt-text">Create a savings account growth model</div>
+                    </div>
+                    <div class="example-prompt" data-prompt="Make a model of attached the file">
+                        <div class="prompt-icon">📄</div>
+                        <div class="prompt-text">Make a model of the attached file</div>
+                    </div>
+                </div>
+                
+                <div class="input-container main-width" id="input-container">
+                    <div id="file-preview" class="file-preview" style="display: none;"></div>
+                    <div class="input-wrapper">
+                        <button id="file-button" class="file-button" title="Attach file">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                                <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66L9.64 16.2a2 2 0 01-2.83-2.83l8.49-8.49" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                        </button>
+                        <textarea 
+                            id="message-input" 
+                            placeholder="Message AI..." 
+                            rows="1"
+                            disabled
+                        ></textarea>
+                        <button id="send-button" data-action="send" disabled>
+                            <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+                                <path d="M7 11L12 6L17 11M12 18V7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                        </button>
+                    </div>
+                    <input type="file" id="file-input" style="display: none;">
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
