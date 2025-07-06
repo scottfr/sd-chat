@@ -22,7 +22,11 @@ The o3 model is much better than the GPT-4.1 model.
 
 Most of SD Chat was written using Claude Code. IT MAY HAVE BUGS. USE IT AT YOUR OWN RISK.
 
-Screenshots:
+## SD Chat
+
+👉 https://scottfr.github.io/sd-chat/
+
+## Screenshots
 
 ![Blank](docs/blank.png)
 ![Chat](docs/chat.png)
