@@ -2,7 +2,7 @@
 
 This is an experimental proof-of-concept chat-based model builder.
 
-🎥 Overview: https://share.descript.com/view/jV5kM1ZDIR9
+🎥 Video Overview: https://share.descript.com/view/jV5kM1ZDIR9
 
 It supports the following using a chat UI:
 
